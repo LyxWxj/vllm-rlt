@@ -89,3 +89,12 @@ def test_wavefront_prefix_cache_and_async_match_eager(asynchronous):
     ]
     assert engine.cache_manager.prefix_hits > 0
     assert engine.cache_manager.num_used_blocks == 0
+
+
+def test_wavefront_prefill_requires_last_exited_layout():
+    with pytest.raises(ValueError, match="LAST_EXITED"):
+        LLMEngine(
+            OuroForCausalLM(OuroConfig.tiny()),
+            cache_config=CacheConfig(64, 2, "shared"),
+            scheduler_config=SchedulerConfig(wavefront_prefill=True),
+        )
