@@ -1,5 +1,7 @@
 """Correctness checks for depth-aware wavefront prompt prefill."""
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -98,3 +100,57 @@ def test_wavefront_prefill_requires_last_exited_layout():
             cache_config=CacheConfig(64, 2, "shared"),
             scheduler_config=SchedulerConfig(wavefront_prefill=True),
         )
+
+
+@pytest.mark.gpu
+def test_wavefront_async_prefix_and_decode_graphs_match_eager():
+    if torch.version.hip:
+        pytest.skip("CUDA Graph validation is NVIDIA-specific")
+    config = replace(OuroConfig.tiny(), head_dim=64)
+    params = SamplingParams(max_tokens=2, min_loops=4, max_loops=4, ignore_eos=True)
+
+    def make(wavefront, graphs):
+        torch.manual_seed(123)
+        return LLMEngine(
+            OuroForCausalLM(config).to("cuda", torch.bfloat16),
+            cache_config=CacheConfig(
+                128,
+                16,
+                enable_prefix_caching=True,
+                incremental_allocation=True,
+            ),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=4,
+                max_num_batched_tokens=4,
+                prefill_chunk_size=2,
+                wavefront_prefill=wavefront,
+            ),
+            exit_config=ExitConfig("trace", depths_by_request={"a": [4, 4]}),
+            execution_config=ExecutionConfig(
+                async_scheduling=True,
+                static_buffers=True,
+                pad_to_power_of_two=True,
+                cuda_graphs=graphs,
+            ),
+            attention_backend="triton",
+        )
+
+    baseline = make(False, False)
+    expected_engine = make(True, True)
+    prompt = [1 + (index % 63) for index in range(17)]
+    baseline.add_request("a", prompt, params)
+    expected_engine.add_request("a", prompt, params)
+    expected, _ = drain(baseline)
+    actual, _ = drain(expected_engine)
+    assert [(o.token_ids, o.exit_depths) for o in actual] == [
+        (o.token_ids, o.exit_depths) for o in expected
+    ]
+    assert expected_engine.model_runner.graphs.captures > 0
+    assert expected_engine.model_runner.graphs.replays > 0
+
+    expected_engine.add_request("a", prompt, params)
+    second, _ = drain(expected_engine)
+    assert [(o.token_ids, o.exit_depths) for o in second] == [
+        (o.token_ids, o.exit_depths) for o in actual
+    ]
+    assert expected_engine.cache_manager.prefix_hits > 0
