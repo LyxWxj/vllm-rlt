@@ -99,7 +99,7 @@ The controlled benchmark compares the same branch with `wavefront_prefill` disab
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m benchmarks.wavefront_prefill \
   --device cuda --attention-backend triton --async-scheduling --cuda-graphs \
-  --prompt-length 128 --prefill-chunk-size 2 --max-num-batched-tokens 4 \
+  --prompt-length 96 --prefill-chunk-size 2 --max-num-batched-tokens 4 \
   --profile /tmp/wavefront-prefill.json.gz --output /tmp/wavefront-prefill.json
 ```
 

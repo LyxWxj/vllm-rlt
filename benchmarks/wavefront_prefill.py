@@ -143,7 +143,7 @@ def benchmark(
     *,
     device="cpu",
     attention_backend=None,
-    prompt_length=128,
+    prompt_length=96,
     max_tokens=4,
     chunk_size=2,
     batch_tokens=4,
@@ -216,7 +216,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--attention-backend", choices=["torch", "triton"], default=None)
-    parser.add_argument("--prompt-length", type=int, default=128)
+    parser.add_argument("--prompt-length", type=int, default=96)
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument("--prefill-chunk-size", type=int, default=2)
     parser.add_argument("--max-num-batched-tokens", type=int, default=4)
