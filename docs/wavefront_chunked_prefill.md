@@ -91,3 +91,16 @@ Measure:
 Cover a single long prompt, short prompts arriving behind a long prompt, bimodal prompt lengths, and continuous prefill arrivals while decode requests are active. Verify output token IDs and exit depths against the existing full-depth prefill path. Also compare KV contents or deterministic logits at the prompt boundary so matching sampled tokens cannot hide a cache mismatch.
 
 Treat the change as beneficial only if it preserves correctness and improves the targeted service metric on the intended workloads without unacceptable single-request TTFT or memory regressions. If effective batch occupancy rises but throughput and latency do not improve, the added scheduling state is not justified.
+
+## Benchmark Command
+
+The controlled benchmark compares the same branch with `wavefront_prefill` disabled and enabled. It reports total time, output throughput, prefill rows per batch, recurrent graph captures/replays, and can export a Chrome trace:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m benchmarks.wavefront_prefill \
+  --device cuda --attention-backend triton --async-scheduling --cuda-graphs \
+  --prompt-length 128 --prefill-chunk-size 2 --max-num-batched-tokens 4 \
+  --profile /tmp/wavefront-prefill.json.gz --output /tmp/wavefront-prefill.json
+```
+
+The workload targets a low-concurrency long prompt where one chunk has only a few token rows. The benchmark checks output equality before reporting speedup; a speedup below `1.0` is a valid result and means this workload did not benefit from the finer scheduling granularity.
