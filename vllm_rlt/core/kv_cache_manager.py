@@ -533,6 +533,52 @@ class KVCacheManager:
         for allocation, depth, position in batch.rows:
             allocation.written[self._plane(depth)][layer].add(position)
 
+    @torch.no_grad()
+    def attend_with_current(
+        self,
+        layer: int,
+        batch: _PreparedKVBatch,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend to paged history plus current K/V without persisting the current row."""
+        self._validate_layer(layer)
+        self._require_live_batch(batch)
+        self._validate_tensor(q, len(batch.position_ids), "q", query=True)
+        self._validate_tensor(k, len(batch.position_ids), "k")
+        self._validate_tensor(v, len(batch.position_ids), "v")
+        if not batch.rows:
+            return torch.empty_like(q)
+
+        # FlashAttention's cache-update entrypoints write supplied K/V in place.
+        # Keep their existing path until the backend can consume transient K/V.
+        if self.layout != "shared" or self.backend not in ("torch", "triton"):
+            self._write_prepared(layer, batch, k, v)
+            return self._attend_prepared(layer, batch, q)
+
+        for allocation, depth, position in batch.rows:
+            self._require_prefix(allocation, layer, depth, position)
+        if self.backend == "triton":
+            return triton_paged_attention(
+                q,
+                self.key_cache[:, layer],
+                self.value_cache[:, layer],
+                batch.block_tables,
+                batch.context_lengths,
+                current_key=k,
+                current_value=v,
+            )
+        return torch_paged_attention(
+            q,
+            self.key_cache[:, layer],
+            self.value_cache[:, layer],
+            batch.block_tables,
+            batch.context_lengths,
+            current_key=k,
+            current_value=v,
+        )
+
     def _require_prefix(self, allocation, layer, depth, length):
         written = allocation.written[self._plane(depth)][layer]
         if length > written.prefix:

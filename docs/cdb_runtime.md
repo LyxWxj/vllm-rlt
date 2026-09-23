@@ -61,6 +61,8 @@ For a task-assigned GPU, set `CUDA_VISIBLE_DEVICES` and add `--device cuda --att
 
 SHARED is not equivalent to LAST-EXITED. A later token reads every earlier token's final KV at all depths. To make that meaning independent of chunk boundaries, the shared prefill runner completes all loops for one position before advancing that request. Different requests can still be batched at each position wave. This is a correctness-oriented implementation and can be slower than packed depth-major prefill. It is not a claim to reproduce an unpublished optimized shared-prefill kernel.
 
+For Torch and Triton attention, intermediate shared-prefill loops pass the current token's K/V directly to attention without storing them in the paged cache. Only the final prefill loop persists K/V for later token positions. Other attention backends retain the write-before-attend path.
+
 SHARED reduces physical planes from `total_ut_steps` to one; block accounting and reclaim follow the physical plane count. Full-lifetime position reservation is retained. Incremental reservation/preemption and prefix sharing remain outside this change.
 
 ## Submission lifetime and overlap

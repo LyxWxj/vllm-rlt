@@ -15,6 +15,53 @@ def dense_attention(q, k, v):
     )[0, :, 0].to(q.dtype)
 
 
+def compare_transient_current_kv(device, backend, dtype):
+    torch.manual_seed(56)
+    caches = [
+        KVCacheManager(
+            1,
+            2,
+            32,
+            8,
+            2,
+            2,
+            device=device,
+            dtype=dtype,
+            backend=backend,
+            layout="shared",
+        )
+        for _ in range(2)
+    ]
+    history_k = torch.randn(1, 2, 32, device=device, dtype=dtype)
+    history_v = torch.randn_like(history_k)
+    for cache in caches:
+        assert cache.allocate("request", 4)
+        cache.write(0, ["request"], [0], [0], history_k, history_v)
+
+    q = torch.randn(1, 4, 32, device=device, dtype=dtype)
+    current_k = torch.randn(1, 2, 32, device=device, dtype=dtype)
+    current_v = torch.randn_like(current_k)
+    request_ids, depths, positions = ["request"], [1], [1]
+    reference_batch = caches[0]._prepare_batch(request_ids, depths, positions)
+    caches[0]._write_prepared(0, reference_batch, current_k, current_v)
+    expected = caches[0]._attend_prepared(0, reference_batch, q)
+
+    transient_batch = caches[1]._prepare_batch(request_ids, depths, positions)
+    actual = caches[1].attend_with_current(0, transient_batch, q, current_k, current_v)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 2e-5
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    assert 1 not in caches[1]._allocations["request"].written[0][0]
+
+
+def test_shared_attention_uses_transient_current_kv_without_persisting():
+    compare_transient_current_kv("cpu", "torch", torch.float32)
+
+
+@pytest.mark.gpu
+def test_shared_triton_attention_uses_transient_current_kv_without_persisting():
+    compare_transient_current_kv("cuda", "triton", torch.bfloat16)
+
+
 def test_packed_prefill_is_causal_for_repeated_request_ids():
     torch.manual_seed(32)
     cache = KVCacheManager(1, 2, 7, 12, 2, 2)

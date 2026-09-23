@@ -99,6 +99,8 @@ class OuroAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         batch: "_PreparedKVBatch",
         cache: "KVCacheManager",
+        *,
+        persist_kv: bool = True,
     ) -> torch.Tensor:
         shape = (hidden.shape[0], -1, self.config.head_dim)
         q = self.q_proj(hidden).view(shape)
@@ -107,8 +109,11 @@ class OuroAttention(nn.Module):
         cos, sin = position_embeddings
         q = q * cos + _rotate_half(q) * sin
         k = k * cos + _rotate_half(k) * sin
-        cache._write_prepared(self.layer_idx, batch, k, v)
-        output = cache._attend_prepared(self.layer_idx, batch, q)
+        if persist_kv:
+            cache._write_prepared(self.layer_idx, batch, k, v)
+            output = cache._attend_prepared(self.layer_idx, batch, q)
+        else:
+            output = cache.attend_with_current(self.layer_idx, batch, q, k, v)
         return self.o_proj(output.reshape(hidden.shape[0], -1))
 
 
@@ -139,8 +144,16 @@ class OuroDecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         batch: "_PreparedKVBatch",
         cache: "KVCacheManager",
+        *,
+        persist_kv: bool = True,
     ) -> torch.Tensor:
-        attention = self.self_attn(self.input_layernorm(hidden), position_embeddings, batch, cache)
+        attention = self.self_attn(
+            self.input_layernorm(hidden),
+            position_embeddings,
+            batch,
+            cache,
+            persist_kv=persist_kv,
+        )
         hidden = hidden + self.input_layernorm_2(attention)
         return hidden + self.post_attention_layernorm_2(
             self.mlp(self.post_attention_layernorm(hidden))
@@ -206,11 +219,11 @@ class OuroForCausalLM(nn.Module):
         batch = cache._prepare_batch(request_ids, depths, positions)
         return self.recurrent_prepared(hidden, batch, cache, compute_gate=compute_gate)
 
-    def recurrent_prepared(self, hidden, batch, cache, *, compute_gate=True):
+    def recurrent_prepared(self, hidden, batch, cache, *, compute_gate=True, persist_kv=True):
         """Run core with runner-owned metadata, including inactive padding rows."""
         position_embeddings = self.model.rotary_emb(hidden, batch.position_ids)
         for layer in self.model.layers:
-            hidden = layer(hidden, position_embeddings, batch, cache)
+            hidden = layer(hidden, position_embeddings, batch, cache, persist_kv=persist_kv)
         # Norm is inside the recurrence in Ouro; this normalized state is the
         # next loop's input as well as the gate and LM head input.
         hidden = self.model.norm(hidden)

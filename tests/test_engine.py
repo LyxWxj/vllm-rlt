@@ -52,6 +52,27 @@ def test_chunked_packed_generation_matches_serial(mode):
     assert llm.engine.cache_manager.num_used_blocks == 0
 
 
+def test_shared_prefill_persists_only_final_loop_kv():
+    engine = LLMEngine(
+        tiny_model(),
+        cache_config=CacheConfig(64, 2, "shared"),
+    )
+    writes = []
+    write_prepared = engine.cache_manager._write_prepared
+
+    def record_write(layer, batch, keys, values):
+        writes.extend((layer, depth, position) for _, depth, position in batch.rows)
+        return write_prepared(layer, batch, keys, values)
+
+    engine.cache_manager._write_prepared = record_write
+    engine.add_request("shared", [1, 2, 3], SamplingParams(max_tokens=1, ignore_eos=True))
+    engine.step()
+
+    assert len(writes) == len(engine.model.model.layers) * 3
+    assert {depth for _, depth, _ in writes} == {engine.model.config.total_ut_steps - 1}
+    engine.abort_request("shared")
+
+
 def test_cumulative_gate_and_minimum_depth():
     model = tiny_model()
     with torch.no_grad():
