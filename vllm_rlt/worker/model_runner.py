@@ -314,7 +314,23 @@ class ModelRunner:
             # Same workspace metadata can be refilled only once previous DMA is done.
             if workspace:
                 workspace.acquire()
-            hidden, _ = self._core(hidden, ids, [depth] * len(ids), positions, workspace, size)
+            if cache.layout == "shared":
+                metadata = (
+                    workspace.prepare(cache, ids, [depth] * len(ids), positions, size)
+                    if workspace
+                    else cache._prepare_batch(ids, [depth] * len(ids), positions)
+                )
+                hidden, _ = self.model.recurrent_prepared(
+                    hidden,
+                    metadata,
+                    cache,
+                    compute_gate=False,
+                    persist_kv=depth == self.model.config.total_ut_steps - 1,
+                )
+            else:
+                hidden, _ = self._core(
+                    hidden, ids, [depth] * len(ids), positions, workspace, size
+                )
             if workspace:
                 workspace.release()
         return hidden
