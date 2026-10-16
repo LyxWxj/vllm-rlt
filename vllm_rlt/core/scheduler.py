@@ -1,29 +1,30 @@
 """CPU scheduling at stage/loop boundaries, independent of model execution."""
 
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum, auto
 
 from vllm_rlt.config import SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.scheduling_policy import create_scheduling_policy
-from vllm_rlt.request import FinishReason, Request, Stage
+from vllm_rlt.request import FinishReason, Request, RequestStatus
 
-# Items of these stages cover a contiguous span of prompt tokens, so their KV
-# frontier is the span end rather than the request's decode position.
-_SPAN_STAGES = (
-    Stage.PREFILL,
-    Stage.PREFILLING_PRELUDE,
-    Stage.PREFILLING_RECURRENT,
-    Stage.SPECULATIVE,
+# Work that covers a contiguous prompt span uses the span end as its KV frontier.
+_SPAN_WORKS = frozenset(
+    (
+        WorkKey.PROMPT_ATOMIC,
+        WorkKey.PROMPT_PRELUDE,
+        WorkKey.PROMPT_RECURRENT,
+        WorkKey.SPECULATIVE,
+    )
 )
-# Stages that must reserve KV capacity for that frontier before selection.
-_CAPACITY_STAGES = _SPAN_STAGES + (Stage.PRELUDE, Stage.RECURRENT)
+_CAPACITY_WORKS = _SPAN_WORKS | {WorkKey.DECODE_PRELUDE, WorkKey.DECODE_RECURRENT}
 
 
 @dataclass(frozen=True)
 class ScheduledRequest:
     request: Request
-    # PREFILL and SPECULATIVE use a contiguous span; ordinary decode uses one row.
+    work: WorkKey
     token_start: int = 0
     token_count: int = 1
     # Recurrence position/depth are snapshotted for both prompt and generation.
@@ -31,21 +32,33 @@ class ScheduledRequest:
     depth: int | None = None
     chunk_start: int | None = None
     completes_prompt: bool = False
-    phase: Stage | None = None
 
 
 @dataclass(frozen=True)
 class SchedulerOutput:
-    stage: Stage
     requests: list[ScheduledRequest]
+
+    @property
+    def works(self) -> frozenset[WorkKey]:
+        return frozenset(item.work for item in self.requests)
+
+    @property
+    def is_mixed(self) -> bool:
+        return len(self.works) > 1
+
+    @property
+    def split_prefilling(self) -> bool:
+        return any(
+            item.work in (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
+            for item in self.requests
+        )
 
     @property
     def is_speculative(self) -> bool:
         """Execution-mode flag for this batch, not the engine-wide configuration."""
-        return self.stage == Stage.SPECULATIVE
-
-    def phase_for(self, scheduled_request):
-        return scheduled_request.phase or self.stage
+        return bool(self.requests) and all(
+            item.work == WorkKey.SPECULATIVE for item in self.requests
+        )
 
     @property
     def num_tokens(self) -> int:
@@ -108,7 +121,9 @@ class Scheduler:
         self.cache_manager = cache_manager
         self.speculative_config = speculative_config
         self.requests: dict[str, Request] = {}
-        self.queues: dict[Stage, deque[str]] = {s: deque() for s in Stage}
+        self.waiting: deque[str] = deque()
+        self.work_queues: dict[WorkKey, deque[str]] = {work: deque() for work in WorkKey}
+        self.admission_slots: set[str] = set()
         # Bound by Engine when preemption is enabled. These callbacks can copy
         # device state and mutate queues; they are operations, not predicates.
         self.preempt_callback = None
@@ -126,36 +141,87 @@ class Scheduler:
     def add_request(self, request: Request):
         if request.request_id in self.requests:
             raise ValueError(f"duplicate request ID: {request.request_id}")
+        request.status = RequestStatus.WAITING
         self.requests[request.request_id] = request
-        self.queues[Stage.WAITING].append(request.request_id)
+        self.waiting.append(request.request_id)
 
-    def enqueue(self, request: Request, stage: Stage):
-        request.stage = stage
-        self.queues[stage].append(request.request_id)
+    def activate_request(self, request: Request):
+        """Mark a resource-ready request active and reserve its admission slot."""
+        if self.requests.get(request.request_id) is not request:
+            raise ValueError("only the registered request can be activated")
+        if request.status not in (RequestStatus.WAITING, RequestStatus.RECEIVING):
+            raise ValueError("only waiting or receiving requests can be activated")
+        request.status = RequestStatus.ACTIVE
+        self.admission_slots.add(request.request_id)
+
+    def has_admission_capacity(self) -> bool:
+        return len(self.admission_slots) < self.config.max_num_seqs
+
+    def release_admission_slot(self, request: Request):
+        if self.requests.get(request.request_id) is not request:
+            return False
+        self.admission_slots.discard(request.request_id)
+        return True
+
+    def enqueue_work(self, request: Request, work: WorkKey):
+        if self.requests.get(request.request_id) is not request:
+            raise ValueError("only the registered request can enter a work queue")
+        if request.status != RequestStatus.ACTIVE:
+            raise ValueError("only active requests can enter a work queue")
+        if self.pending_work(request) is not None:
+            raise ValueError(f"request {request.request_id!r} already has pending work")
+        self.work_queues[work].append(request.request_id)
+
+    def pending_work(self, request: Request) -> WorkKey | None:
+        for work, queue in self.work_queues.items():
+            if request.request_id in queue:
+                return work
+        return None
+
+    def remove_pending_work(self, request: Request) -> WorkKey | None:
+        pending = None
+        for work, queue in self.work_queues.items():
+            if request.request_id in queue:
+                pending = work if pending is None else pending
+                while request.request_id in queue:
+                    queue.remove(request.request_id)
+        return pending
+
+    def _remove_queued_request(self, request: Request):
+        while request.request_id in self.waiting:
+            self.waiting.remove(request.request_id)
+        self.remove_pending_work(request)
+
+    def park_waiting(self, request: Request):
+        self._remove_queued_request(request)
+        self.release_admission_slot(request)
+        request.status = RequestStatus.WAITING
+        self.waiting.append(request.request_id)
 
     def suspend_for_transfer(self, request):
         """Stop scheduling without freeing resources that a transfer still borrows."""
         if self.requests.get(request.request_id) is not request:
             return False
-        for queue in self.queues.values():
-            while request.request_id in queue:
-                queue.remove(request.request_id)
-        request.stage = Stage.TRANSFERRING
+        self._remove_queued_request(request)
+        request.status = RequestStatus.TRANSFERRING
         return True
 
     def finish(self, request: Request, reason: FinishReason):
         # A delayed EOS can stop a request already queued for its next stage.
-        for queue in self.queues.values():
-            while request.request_id in queue:
-                queue.remove(request.request_id)
+        self.mark_finished(request, reason)
+        self.release_admission_slot(request)
         self.cache_manager.free(request.request_id)
-        request.stage = Stage.FINISHED
+        self.requests.pop(request.request_id, None)
+
+    def mark_finished(self, request: Request, reason: FinishReason):
+        """Mark logical completion while a runner may still own device resources."""
+        self._remove_queued_request(request)
+        request.status = RequestStatus.FINISHED
         request.finish_reason = reason
         request.hidden_state = None
         request.input_token_tensor = None
         request.num_output_placeholders = 0
         request.num_speculative_rounds = 0
-        self.requests.pop(request.request_id)
 
     def abort(self, request_id: str) -> Request:
         request = self.requests[request_id]
@@ -173,15 +239,15 @@ class Scheduler:
         Lower values go first: -5, 0, 10. Equal values retain current queue order.
         FCFS preserves queue order, but admission may still bypass blocked requests.
         """
-        waiting = self.queues[Stage.WAITING]
+        waiting = self.waiting
         if self.config.policy == "priority":
             ordered = sorted(waiting, key=lambda rid: self.requests[rid].sampling_params.priority)
             waiting.clear()
             waiting.extend(ordered)
         return waiting
 
-    def _ensure_active_slot(self, request: Request, active_count: int) -> int | None:
-        """Return the updated active count, or None when admission must stop.
+    def _ensure_admission_slot(self, request: Request) -> bool:
+        """Return whether admission has a free slot.
 
         A full engine may make room for a higher-priority arrival. The callback
         suspends another request and moves it to WAITING; it does not admit the
@@ -189,21 +255,20 @@ class Scheduler:
         Admission runs before any batch is selected, so no request is excluded
         from preemption here.
         """
-        if active_count < self.config.max_num_seqs:
-            return active_count
-        if (
+        if self.has_admission_capacity():
+            return True
+        preempted = (
             self.config.policy == "priority"
             and self.preempt_callback is not None
             and self.preempt_callback(request, priority_only=True, excluded=frozenset())
-        ):
-            return active_count - 1
-        return None
+        )
+        return preempted and self.has_admission_capacity()
 
     def _try_resume(self, request: Request) -> ResumeResult:
         """Translate the existing restoration callback's three-way result.
 
         None: no snapshot, continue fresh admission.
-        True: resources/state restored and the original stage already enqueued.
+        True: resources/state restored and resume work already enqueued.
         False: snapshot exists, but restoration cannot obtain capacity yet.
         """
         restored = self.resume_callback(request) if self.resume_callback is not None else None
@@ -222,12 +287,8 @@ class Scheduler:
         cache = self.cache_manager
         reserved = 0
         for request in self.requests.values():
-            active = request.stage not in (Stage.WAITING, Stage.RECEIVING)
-            if request.stage not in (
-                Stage.PREFILL,
-                Stage.PREFILLING_PRELUDE,
-                Stage.PREFILLING_RECURRENT,
-            ) and not (reserve_outputs and active):
+            active = request.status == RequestStatus.ACTIVE
+            if self.pending_work(request) not in _SPAN_WORKS and not (reserve_outputs and active):
                 continue
             tokens = len(request.prompt_token_ids)
             if reserve_outputs:
@@ -236,7 +297,7 @@ class Scheduler:
             reserved += max(0, cache.required_blocks(tokens) - allocated)
         return reserved
 
-    def _plan_admission(self, request: Request, active_count: int) -> AdmissionPlan:
+    def _plan_admission(self, request: Request) -> AdmissionPlan:
         """Describe prefix reuse, physical allocation and logical admission cost.
 
         With 8 prompt tokens and 5 outputs, capacity is 12: the last sampled
@@ -265,7 +326,7 @@ class Scheduler:
         required = cache.required_blocks(budget_tokens) - len(prefix) * cache.storage_depths
         reserved = self._reserved_growth_blocks(reserve_outputs=reserve_outputs)
         # Allow an otherwise idle engine to start a large request.
-        admission_headroom_blocks = cache.watermark_blocks if active_count else 0
+        admission_headroom_blocks = cache.watermark_blocks if self.admission_slots else 0
         # num_free_blocks includes evictable prefix-only blocks. Reusing those
         # blocks makes them non-evictable: do not count the same capacity twice.
         # Example: free=8 fresh + 4 cached, demand=12 with a 4-block prefix.
@@ -305,10 +366,9 @@ class Scheduler:
                 len(request.prefill_depth_ranges),
                 start=plan.cached_tokens,
             )
-        if self.atomic_prefill:
-            self.enqueue(request, Stage.PREFILL)
-        else:
-            self.enqueue(request, Stage.PREFILLING_PRELUDE)
+        self.activate_request(request)
+        work = WorkKey.PROMPT_ATOMIC if self.atomic_prefill else WorkKey.PROMPT_PRELUDE
+        self.enqueue_work(request, work)
         return True
 
     def _admit(self):
@@ -318,9 +378,6 @@ class Scheduler:
         admission increments earlier blocked requests' bypass counts; reaching
         the limit stops further bypasses so active requests can drain.
         """
-        active_count = sum(
-            r.stage not in (Stage.WAITING, Stage.RECEIVING) for r in self.requests.values()
-        )
         waiting = self._order_waiting_requests()
         deferred = []
         scan_count = min(len(waiting), self.config.admission_scan_limit)
@@ -329,29 +386,25 @@ class Scheduler:
                 break
             # Peek before popping: preemption may append its victim to WAITING.
             request = self.requests[waiting[0]]
-            available_count = self._ensure_active_slot(request, active_count)
-            if available_count is None:
+            if not self._ensure_admission_slot(request):
                 break
-            active_count = available_count
             request_id = waiting.popleft()
             request = self.requests[request_id]
 
             resume_result = self._try_resume(request)
             if resume_result == ResumeResult.RESTORED:
-                active_count += 1
                 continue
             if resume_result == ResumeResult.BLOCKED:
                 deferred.append(request_id)
                 continue
 
-            plan = self._plan_admission(request, active_count)
+            plan = self._plan_admission(request)
             if not self._commit_admission(request, plan):
                 deferred.append(request_id)
                 if request.admission_bypasses >= self.config.max_admission_bypasses:
                     break
                 continue
 
-            active_count += 1
             for blocked_id in deferred:
                 self.requests[blocked_id].admission_bypasses += 1
             if any(
@@ -362,34 +415,34 @@ class Scheduler:
         # [A, B] deferred must precede the untouched tail in the same order.
         waiting.extendleft(reversed(deferred))
 
-    def _make_scheduled_request(
-        self, request: Request, stage: Stage, token_budget: int
+    def _make_scheduled_work(
+        self, request: Request, work: WorkKey, token_budget: int
     ) -> ScheduledRequest:
-        """Snapshot one request's execution range without advancing its progress.
+        """Snapshot one work item's execution range without advancing progress.
 
         Prompt length 10, prefilled 4, chunk 4, budget 6 -> range [4, 8).
         Decode stages contribute one position; its loop may differ by request.
         """
-        if stage == Stage.PREFILL:
+        if work == WorkKey.PROMPT_ATOMIC:
             start = request.num_prefilled_tokens
             count = min(
                 token_budget, self.config.prefill_chunk_size, len(request.prompt_token_ids) - start
             )
-            return ScheduledRequest(request, start, count)
+            return ScheduledRequest(request, work, start, count)
         # The two split stages are unreachable while atomic prefill is enabled.
-        if stage == Stage.PREFILLING_PRELUDE:
+        if work == WorkKey.PROMPT_PRELUDE:
             start = request.num_preluded_tokens
             count = min(
                 token_budget,
                 self.config.prefill_chunk_size,
                 len(request.prompt_token_ids) - start,
             )
-            return ScheduledRequest(request, start, count, chunk_start=start)
-        if stage == Stage.PREFILLING_RECURRENT:
+            return ScheduledRequest(request, work, start, count, chunk_start=start)
+        if work == WorkKey.PROMPT_RECURRENT:
             start = request.num_prefilled_tokens
             if start >= request.num_preluded_tokens:
                 return ScheduledRequest(
-                    request, start, 0, depth=0, chunk_start=request.prefill_chunk_start
+                    request, work, start, 0, depth=0, chunk_start=request.prefill_chunk_start
                 )
             first_token_depth = request.prefill_depth(start)
             # One run per depth frontier: every token of the run already completed
@@ -406,6 +459,7 @@ class Scheduler:
             )
             return ScheduledRequest(
                 request,
+                work,
                 start,
                 count,
                 depth=first_token_depth,
@@ -415,15 +469,15 @@ class Scheduler:
                     and start + count == len(request.prompt_token_ids)
                 ),
             )
-        if stage == Stage.SPECULATIVE:
+        if work == WorkKey.SPECULATIVE:
             # K candidates plus one bonus distribution. At the output limit,
             # K=0 is an ordinary fixed-depth step and needs no extra KV slot.
             remaining = request.sampling_params.max_tokens - request.num_scheduled_outputs
             count = min(self.speculative_config.num_speculative_tokens + 1, remaining, token_budget)
-            return ScheduledRequest(request, request.position, count)
-        if stage == Stage.RECURRENT:
-            return ScheduledRequest(request, request.position, depth=request.loops_done)
-        return ScheduledRequest(request)
+            return ScheduledRequest(request, work, request.position, count)
+        if work == WorkKey.DECODE_RECURRENT:
+            return ScheduledRequest(request, work, request.position, depth=request.loops_done)
+        return ScheduledRequest(request, work)
 
     def _ensure_execution_capacity(
         self, request: Request, frontier: int, *, selected: set[str]
@@ -455,28 +509,24 @@ class Scheduler:
         """
         return request.num_preluded_tokens == request.num_prefilled_tokens
 
-    def has_ready(self, phase: Stage) -> bool:
+    def has_ready_work(self, work: WorkKey) -> bool:
         """A blocked transport queue must not hide another runnable phase."""
-        queue = self.queues[phase]
+        queue = self.work_queues[work]
         if self.execution_ready is None:
             return bool(queue)
         return any(self.execution_ready(self.requests[rid]) for rid in queue)
 
-    def has_ready_phases(self, *phases: Stage) -> bool:
-        """Return whether every listed phase has at least one runnable request."""
-        return bool(phases) and all(self.has_ready(phase) for phase in phases)
+    def has_ready_works(self, *works: WorkKey) -> bool:
+        return any(self.has_ready_work(work) for work in works)
 
-    def _take(self, stage: Stage) -> SchedulerOutput | None:
-        return self.take_stages((stage,), label=stage)
-
-    def take_stages(self, stages, *, label, eligible=None):
+    def take_works(self, works, *, eligible=None):
         """Select compatible requests across queues under one budget/reservation set."""
         eligible = eligible if eligible is not None else self.execution_ready
         token_budget = self.config.max_num_batched_tokens
         scheduled_requests = []
         selected: set[str] = set()
-        for stage in stages:
-            queue = self.queues[stage]
+        for work in works:
+            queue = self.work_queues[work]
             remaining = len(queue)
             while (
                 queue
@@ -486,31 +536,33 @@ class Scheduler:
             ):
                 remaining -= 1
                 request = self.requests[queue.popleft()]
+                if request.request_id in selected:
+                    continue
                 if eligible is not None and not eligible(request):
                     queue.append(request.request_id)
                     continue
-                if stage == Stage.PREFILLING_PRELUDE and not self._prelude_window_open(request):
+                if work == WorkKey.PROMPT_PRELUDE and not self._prelude_window_open(request):
                     queue.append(request.request_id)
                     continue
-                if stage == Stage.SPECULATIVE and (
+                if work == WorkKey.SPECULATIVE and (
                     request.num_speculative_rounds >= 2
                     or request.num_scheduled_outputs >= request.sampling_params.max_tokens
                 ):
                     queue.append(request.request_id)
                     continue
-                scheduled_request = self._make_scheduled_request(request, stage, token_budget)
+                scheduled_request = self._make_scheduled_work(request, work, token_budget)
                 if (
-                    stage in (Stage.PREFILLING_PRELUDE, Stage.PREFILLING_RECURRENT)
+                    work in (WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT)
                     and scheduled_request.token_count <= 0
                 ):
                     queue.append(request.request_id)
                     continue
-                if stage in _CAPACITY_STAGES:
+                if work in _CAPACITY_WORKS:
                     # A scheduled span declares a prompt frontier; decode stages advance the
                     # request's own position by one.
                     frontier = (
                         scheduled_request.token_start + scheduled_request.token_count
-                        if stage in _SPAN_STAGES
+                        if work in _SPAN_WORKS
                         else request.position + 1
                     )
                     if not self._ensure_execution_capacity(request, frontier, selected=selected):
@@ -518,18 +570,14 @@ class Scheduler:
                         continue
                 # Selecting A must prevent B's later capacity check from evicting A.
                 selected.add(request.request_id)
-                scheduled_requests.append(replace(scheduled_request, phase=stage))
+                scheduled_requests.append(scheduled_request)
                 token_budget -= scheduled_request.token_count
         if not scheduled_requests:
             return None
         # Fairness follows the requests actually selected, including a mixed attempt
         # whose other queue could not reserve capacity.
-        selected_phases = {scheduled_request.phase for scheduled_request in scheduled_requests}
-        recorded = (
-            Stage.RECURRENT if Stage.RECURRENT in selected_phases else scheduled_requests[0].phase
-        )
-        self.policy.record_batch(recorded)
-        return SchedulerOutput(label, scheduled_requests)
+        self.policy.record_batch(scheduled_request.work for scheduled_request in scheduled_requests)
+        return SchedulerOutput(scheduled_requests)
 
     def schedule(self, *, prefer_recurrent=False) -> SchedulerOutput | None:
         """Choose queued requests or an admission opportunity, then build a batch.
@@ -541,6 +589,6 @@ class Scheduler:
         """
         if not self.requests:
             return None
-        if not self.accepts_prompt and self.queues[Stage.WAITING]:
+        if not self.accepts_prompt and self.waiting:
             raise ValueError("decode stage requests must enter through reserve_transfer")
         return self.policy.schedule(self, prefer_recurrent=prefer_recurrent)

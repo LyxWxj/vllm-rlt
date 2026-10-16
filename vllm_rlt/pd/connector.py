@@ -6,7 +6,8 @@ from dataclasses import dataclass, field, replace
 
 import torch
 
-from vllm_rlt.request import Request, Stage
+from vllm_rlt.core.execution import WorkKey
+from vllm_rlt.request import Request
 
 from .transport import kv_segments, partition_segments
 
@@ -91,11 +92,11 @@ class PDStageConnector:
             and self.transport.inflight_bytes < self.config.max_inflight_bytes
         )
 
-    def prefill_submitted(self, request, *, phase, start, progress, event, stream):
+    def prefill_submitted(self, request, *, work, start, progress, event, stream):
         transfer = self.transfers[request.request_id]
         if transfer.request is not request:
             raise RuntimeError("stale transfer generation")
-        if phase == Stage.PREFILLING_PRELUDE:
+        if work == WorkKey.PROMPT_PRELUDE:
             transfer.transfer_overlaps += self.transport.busy(transfer.tid)
         if not progress.chunk_complete:
             transfer.last_event = event

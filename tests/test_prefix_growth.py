@@ -3,10 +3,11 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestStatus
 
 
 def model():
@@ -84,8 +85,8 @@ def test_incremental_growth_matches_reserved_generation():
     assert outputs[0].exit_depths == outputs[1].exit_depths
 
 
-@pytest.mark.parametrize("stage", [Stage.PREFILLING_PRELUDE, Stage.PREFILLING_RECURRENT])
-def test_incremental_split_prefill_reserves_prompt_growth(stage):
+@pytest.mark.parametrize("work", [WorkKey.PROMPT_PRELUDE, WorkKey.PROMPT_RECURRENT])
+def test_incremental_split_prefill_reserves_prompt_growth(work):
     prompt = list(range(1, 9))
     e = LLMEngine(
         model(),
@@ -102,10 +103,10 @@ def test_incremental_split_prefill_reserves_prompt_growth(stage):
         e.add_request("split", prompt, SamplingParams(max_tokens=1, ignore_eos=True))
         e.scheduler._admit()
         request = e.scheduler.requests["split"]
-        assert request.stage is Stage.PREFILLING_PRELUDE
-        if stage is Stage.PREFILLING_RECURRENT:
+        assert e.scheduler.pending_work(request) == WorkKey.PROMPT_PRELUDE
+        if work is WorkKey.PROMPT_RECURRENT:
             e.step()
-            assert request.stage is Stage.PREFILLING_RECURRENT
+            assert e.scheduler.pending_work(request) == WorkKey.PROMPT_RECURRENT
 
         allocated = e.cache_manager.allocated_blocks(request.request_id)
         expected = max(0, e.cache_manager.required_blocks(len(prompt)) - allocated)
@@ -308,7 +309,6 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
     # (LIFO), so the victim resumes in another slot whose device token belongs
     # to a different request. Distinct prompts make a stale token visible.
     from vllm_rlt import ExecutionConfig, ExitConfig
-    from vllm_rlt.request import Stage
 
     torch.manual_seed(72)
     m = OuroForCausalLM(tiny_ouro_config(head_dim=64)).to(device="cuda", dtype=torch.bfloat16)
@@ -332,7 +332,7 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
         def record_victim(*args, **kwargs):
             victim = select(*args, **kwargs)
             if victim is not None:
-                victim_stages.append(victim.stage)
+                victim_stages.append(e.scheduler.pending_work(victim))
             return victim
 
         e.preemption._select_preemption_victim = record_victim
@@ -345,7 +345,7 @@ def test_async_preemption_restores_prelude_token_in_a_new_slot():
             )
         results.append({rid: out.token_ids for rid, out in finish(e).items()})
         assert not e.preemption.snapshots and e.cache_manager.num_used_blocks == 0
-    assert Stage.PRELUDE in victim_stages
+    assert WorkKey.DECODE_PRELUDE in victim_stages
     assert results[0] == results[1]
 
 
@@ -372,8 +372,11 @@ def test_watermark_only_limits_incremental_admission(incremental):
         scheduler.add_request(Request(request_id, [1, 2, 3, 4], SamplingParams(max_tokens=1)))
     scheduler._admit()
     assert cache.watermark_blocks == (8 if incremental else 0)
-    assert scheduler.requests["a"].stage == Stage.PREFILL
+    assert scheduler.pending_work(scheduler.requests["a"]) == WorkKey.PROMPT_ATOMIC
     # Full allocation admits both requests into the 16-block pool despite the
     # supplied ratio; incremental allocation retains the configured headroom.
-    assert scheduler.requests["b"].stage == (Stage.WAITING if incremental else Stage.PREFILL)
+    if incremental:
+        assert scheduler.requests["b"].status == RequestStatus.WAITING
+    else:
+        assert scheduler.pending_work(scheduler.requests["b"]) == WorkKey.PROMPT_ATOMIC
     assert cache.num_free_blocks == (8 if incremental else 0)

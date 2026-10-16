@@ -5,11 +5,11 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import SamplingParams, SchedulerConfig
-from vllm_rlt.core.execution import ExecutionBatch, Operation, StateSpan
+from vllm_rlt.core.execution import ExecutionBatch, Operation, StateSpan, WorkKey
 from vllm_rlt.core.kv_cache_manager import KVCacheManager
 from vllm_rlt.core.scheduler import Scheduler, SchedulerOutput
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Request, Stage
+from vllm_rlt.request import Request, RequestStatus
 from vllm_rlt.worker.execution import ExecutionRuntime
 from vllm_rlt.worker.executor import build_execution_batch
 
@@ -100,8 +100,8 @@ def test_scheduled_recurrence_does_not_follow_mutated_request_progress():
     request = Request("r", [1, 2, 3], SamplingParams())
     request.loops_done = 2
     scheduler = Scheduler(SchedulerConfig(), None)
-    scheduled_request = scheduler._make_scheduled_request(request, Stage.RECURRENT, 1)
-    batch = SchedulerOutput(Stage.RECURRENT, [scheduled_request])
+    scheduled_request = scheduler._make_scheduled_work(request, WorkKey.DECODE_RECURRENT, 1)
+    batch = SchedulerOutput([scheduled_request])
     request.loops_done = 3
     request.generated_token_ids.append(4)
     assert build_execution_batch(batch, 4).addresses() == (["r"], [2], [2])
@@ -190,9 +190,11 @@ def test_mixed_policy_runs_real_combined_batches_with_matching_outputs(
                 if output.finished:
                     outputs[output.request_id] = (output.token_ids, output.exit_depths)
             batch = engine.last_schedule
-            if batch is not None and batch.stage == Stage.MIXED:
-                phases = {batch.phase_for(i) for i in batch.requests}
-                if len(phases) == 2:
+            if batch is not None and batch.is_mixed:
+                if (
+                    WorkKey.PROMPT_RECURRENT in batch.works
+                    and WorkKey.DECODE_RECURRENT in batch.works
+                ):
                     # Both storage kinds pass through a single model invocation.
                     if not graphs:
                         assert calls == [batch.num_tokens]
@@ -227,7 +229,7 @@ def mixed_ready_engine():
         engine.add_request(name, prompt, SamplingParams(max_tokens=6, ignore_eos=True))
     for _ in range(100):
         batch = engine.scheduler.schedule()
-        if batch.stage == Stage.MIXED and len({batch.phase_for(i) for i in batch.requests}) == 2:
+        if WorkKey.PROMPT_RECURRENT in batch.works and WorkKey.DECODE_RECURRENT in batch.works:
             return engine, batch
         engine._update(batch, engine.executor.submit(batch).collect())
     pytest.fail("no mixed batch became ready")
@@ -266,14 +268,14 @@ def test_late_mixed_result_cannot_advance_a_reused_request_id():
     old = next(
         scheduled_request.request
         for scheduled_request in batch.requests
-        if batch.phase_for(scheduled_request) == Stage.RECURRENT
+        if scheduled_request.work == WorkKey.DECODE_RECURRENT
     )
     engine.abort_request(old.request_id)
     engine.add_request(old.request_id, [8, 9], SamplingParams(max_tokens=2))
     replacement = engine.scheduler.requests[old.request_id]
     engine._update(batch, result)
     assert replacement is not old
-    assert replacement.stage == Stage.WAITING
+    assert replacement.status == RequestStatus.WAITING
     assert replacement.loops_done == 0
     assert replacement.generated_token_ids == []
     other = next(
@@ -287,12 +289,12 @@ def test_late_mixed_result_cannot_advance_a_reused_request_id():
 def test_mixed_selection_protects_items_selected_from_another_queue(monkeypatch):
     engine, batch = mixed_ready_engine()
     for scheduled_request in batch.requests:
-        engine.scheduler.enqueue(scheduled_request.request, batch.phase_for(scheduled_request))
+        engine.scheduler.enqueue_work(scheduled_request.request, scheduled_request.work)
     selected = next(
-        i.request.request_id for i in batch.requests if batch.phase_for(i) == Stage.RECURRENT
+        i.request.request_id for i in batch.requests if i.work == WorkKey.DECODE_RECURRENT
     )
     blocked = next(
-        i.request.request_id for i in batch.requests if batch.phase_for(i) != Stage.RECURRENT
+        i.request.request_id for i in batch.requests if i.work != WorkKey.DECODE_RECURRENT
     )
     exclusions = []
     monkeypatch.setattr(
@@ -307,7 +309,7 @@ def test_mixed_selection_protects_items_selected_from_another_queue(monkeypatch)
     actual = engine.scheduler.schedule()
     assert [i.request.request_id for i in actual.requests] == [selected]
     assert exclusions == [frozenset({selected})]
-    assert list(engine.scheduler.queues[Stage.PREFILLING_RECURRENT]) == [blocked]
+    assert list(engine.scheduler.work_queues[WorkKey.PROMPT_RECURRENT]) == [blocked]
 
 
 def test_runtime_closes_metadata_lease_when_loop_execution_fails():

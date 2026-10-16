@@ -5,10 +5,11 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, ExecutionConfig, ExitConfig, SamplingParams, SchedulerConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestStatus
 
 
 def make_engine(*, role="mixed", atomic=False, asynchronous=False, mixed=False):
@@ -85,8 +86,8 @@ def test_prefill_handoff_matches_local_execution_without_sampling(atomic, asynch
                 break
         else:
             pytest.fail("prompt did not complete")
-    assert request.stage == Stage.TRANSFERRING
-    assert original.stage == Stage.CODA
+    assert request.status == RequestStatus.TRANSFERRING
+    assert local.scheduler.pending_work(original) == WorkKey.DECODE_CODA
     assert request.generated_token_ids == []
     torch.testing.assert_close(request.hidden_state, original.hidden_state)
     assert all(r is request for r, _ in connector.submissions)
@@ -107,11 +108,11 @@ def test_connector_backpressure_preserves_other_requests_and_queue_membership():
     for _ in range(20):
         engine.step()
     assert engine.scheduler.requests["a"].num_preluded_tokens == 0
-    assert engine.scheduler.requests["b"].stage == Stage.TRANSFERRING
+    assert engine.scheduler.requests["b"].status == RequestStatus.TRANSFERRING
     connector.blocked.clear()
     for _ in range(20):
         engine.step()
-    assert engine.scheduler.requests["a"].stage == Stage.TRANSFERRING
+    assert engine.scheduler.requests["a"].status == RequestStatus.TRANSFERRING
     engine.close()
 
 
@@ -123,7 +124,7 @@ def test_cancelled_import_cannot_activate_reused_request_id():
     engine.add_request("r", [3], SamplingParams(max_tokens=2))
     current = engine.scheduler.requests["r"]
     assert not engine.activate_import(old, torch.zeros(1))
-    assert current.stage == Stage.WAITING
+    assert current.status == RequestStatus.WAITING
     assert current.hidden_state is None
     engine.close()
 
@@ -146,7 +147,7 @@ def test_independent_stage_resources_preserve_output_after_import(atomic, asynch
     assert d.step() == []
     for _ in range(100):
         p.step()
-        if source.stage == Stage.TRANSFERRING:
+        if source.status == RequestStatus.TRANSFERRING:
             break
     else:
         pytest.fail("source prompt did not complete")
@@ -224,7 +225,7 @@ def test_mixed_stage_routes_per_request_and_keeps_local_decode_running(asynchron
     connector.blocked.clear()
     for _ in range(100):
         engine.step()
-        if engine.scheduler.requests["remote"].stage == Stage.TRANSFERRING:
+        if engine.scheduler.requests["remote"].status == RequestStatus.TRANSFERRING:
             break
     else:
         pytest.fail("remote request did not reach its handoff boundary")
@@ -257,7 +258,7 @@ def test_prefill_does_not_hide_a_lost_runnable_request():
     engine = make_engine(role="prefill")
     engine.connector = RecordingConnector()
     engine.add_request("r", [1, 2], SamplingParams(max_tokens=1))
-    engine.scheduler.queues[Stage.WAITING].clear()
+    engine.scheduler.waiting.clear()
     with pytest.raises(RuntimeError, match="no progress"):
         engine.step()
     engine.close()
@@ -275,11 +276,11 @@ def test_prefill_admission_waits_for_transfer_to_release_kv():
     engine.add_request("first", [1, 2], SamplingParams(max_tokens=1))
     engine.step()
     first = engine.scheduler.requests["first"]
-    assert first.stage == Stage.TRANSFERRING
+    assert first.status == RequestStatus.TRANSFERRING
     engine.add_request("second", [1, 2], SamplingParams(max_tokens=1))
     assert engine.step() == []
-    assert engine.scheduler.requests["second"].stage == Stage.WAITING
+    assert engine.scheduler.requests["second"].status == RequestStatus.WAITING
     engine.release_transfer(first)
     engine.step()
-    assert engine.scheduler.requests["second"].stage == Stage.TRANSFERRING
+    assert engine.scheduler.requests["second"].status == RequestStatus.TRANSFERRING
     engine.close()

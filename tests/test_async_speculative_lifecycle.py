@@ -8,10 +8,11 @@ import torch
 
 from tests.helpers import tiny_ouro_config
 from vllm_rlt import CacheConfig, SamplingParams, SchedulerConfig, SpeculativeConfig
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Stage
+from vllm_rlt.request import FinishReason, RequestStatus
 from vllm_rlt.serving.worker import EngineWorker
 from vllm_rlt.worker.async_speculative import SpeculativeRequestState, SpeculativeRoundTicket
 
@@ -58,12 +59,12 @@ class CompletionRunner:
         pass
 
 
-def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True):
+def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True, max_num_seqs=2):
     torch.manual_seed(123)
     engine = LLMEngine(
         OuroForCausalLM(tiny_ouro_config()).eval(),
         cache_config=CacheConfig(num_blocks=128, block_size=4),
-        scheduler_config=SchedulerConfig(max_num_seqs=2, max_num_batched_tokens=8),
+        scheduler_config=SchedulerConfig(max_num_seqs=max_num_seqs, max_num_batched_tokens=8),
         speculative_config=SpeculativeConfig(num_speculative_tokens=2),
     )
     params = SamplingParams(max_tokens=6, min_loops=4, max_loops=4, ignore_eos=True)
@@ -83,7 +84,9 @@ def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True
     )
     tickets = []
     for round_id, (rows, frontier) in enumerate([(3, first_frontier), (2, 6)]):
-        scheduled_request = ScheduledRequest(request, token_start=1 + round_id, token_count=rows)
+        scheduled_request = ScheduledRequest(
+            request, WorkKey.SPECULATIVE, token_start=1 + round_id, token_count=rows
+        )
         host = torch.tensor(
             list(range(10 + 3 * round_id, 10 + 3 * round_id + rows)) + [rows - 1, frontier]
         )
@@ -97,7 +100,7 @@ def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True
         )
         tickets.append(
             SpeculativeRoundTicket(
-                SchedulerOutput(Stage.SPECULATIVE, [scheduled_request]),
+                SchedulerOutput([scheduled_request]),
                 buffer,
                 (state,),
                 (round_id,),
@@ -114,6 +117,27 @@ def prepared_engine(*, bad_second=False, first_frontier=4, retirement_ready=True
     request.num_speculative_rounds = 2
     engine._pending_speculative = tickets.copy()
     return engine, tickets, original_runner
+
+
+def test_finished_speculative_request_holds_admission_slot_until_retirement():
+    engine, _, _ = prepared_engine(retirement_ready=False, max_num_seqs=1)
+    request = engine.scheduler.requests["r"]
+
+    engine._finish(request, FinishReason.LENGTH)
+
+    assert request.status == RequestStatus.FINISHED
+    assert engine.scheduler.admission_slots == {"r"}
+    engine.add_request("next", [5, 6], SamplingParams(max_tokens=1))
+    engine.scheduler._admit()
+    assert engine.scheduler.requests["next"].status == RequestStatus.WAITING
+
+    engine.speculative_runner.retirement_ready = True
+    engine._retire_speculative()
+    assert not engine.scheduler.admission_slots
+    engine.scheduler._admit()
+    assert engine.scheduler.requests["next"].status == RequestStatus.ACTIVE
+    assert engine.scheduler.admission_slots == {"next"}
+    engine.close()
 
 
 @torch.inference_mode()

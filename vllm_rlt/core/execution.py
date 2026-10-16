@@ -17,6 +17,20 @@ class Operation(Enum):
     CODA = "coda"
 
 
+class WorkKey(Enum):
+    PROMPT_ATOMIC = ("prompt_atomic", Operation.PRELUDE)
+    PROMPT_PRELUDE = ("prompt_prelude", Operation.PRELUDE)
+    PROMPT_RECURRENT = ("prompt_recurrent", Operation.RECURRENT)
+    DECODE_PRELUDE = ("decode_prelude", Operation.PRELUDE)
+    DECODE_RECURRENT = ("decode_recurrent", Operation.RECURRENT)
+    DECODE_CODA = ("decode_coda", Operation.CODA)
+    SPECULATIVE = ("speculative", None)
+
+    @property
+    def operation(self) -> Operation | None:
+        return self.value[1]
+
+
 @dataclass(frozen=True)
 class StateSpan:
     request: Request
@@ -41,10 +55,16 @@ class ExecutionBatch:
     # Number of recurrent operations following PRELUDE, or starting at RECURRENT.
     # PRELUDE + N loops retains activations locally until the submission boundary.
     loop_count: int = 0
+    # Runtime work label; direct batches infer it from chunk spans when omitted.
+    split_prefilling: bool | None = None
 
     def __post_init__(self):
         if self.loop_count < 0:
             raise ValueError("loop_count must be nonnegative")
+        if self.split_prefilling is None:
+            object.__setattr__(self, "split_prefilling", self.has_chunks)
+        elif self.has_chunks and not self.split_prefilling:
+            raise ValueError("chunk spans require split prefill")
         if self.operation == Operation.RECURRENT and self.loop_count == 0:
             object.__setattr__(self, "loop_count", 1)
         if self.operation == Operation.CODA and self.loop_count:

@@ -16,10 +16,11 @@ from vllm_rlt import (
     SchedulerConfig,
     SpeculativeConfig,
 )
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.scheduler import ScheduledRequest, SchedulerOutput
 from vllm_rlt.engine.llm_engine import LLMEngine
 from vllm_rlt.models import OuroForCausalLM
-from vllm_rlt.request import Request, Stage
+from vllm_rlt.request import Request
 from vllm_rlt.worker.sampler import Sampler
 from vllm_rlt.worker.speculative import greedy_accept, rejection_sample
 
@@ -125,7 +126,7 @@ def test_reused_hidden_logits_and_all_kv_match_serial_oracle(dtype, device, back
         lambda module, inputs, output: head_outputs.append(output.detach().clone())
     )
     try:
-        runner.submit(SchedulerOutput(Stage.SPECULATIVE, [ScheduledRequest(r, 3, 4)])).collect()
+        runner.submit(SchedulerOutput([ScheduledRequest(r, WorkKey.SPECULATIVE, 3, 4)])).collect()
     finally:
         hook.remove()
         m.recurrent_prepared = core
@@ -341,7 +342,7 @@ def test_acquire_generator_uses_the_logits_device(monkeypatch):
 
 def test_speculative_greedy_execution_never_acquires_a_generator(monkeypatch):
     # The CODA path has the same check in test_engine.py; this one proves the
-    # contract on a request that really executes through Stage.SPECULATIVE, so a
+    # contract on a request that really executes speculative work, so a
     # generator that is created but unused would still be caught.
     e = engine(model())
 
@@ -350,15 +351,15 @@ def test_speculative_greedy_execution_never_acquires_a_generator(monkeypatch):
 
     monkeypatch.setattr(e.rng, "acquire", forbidden)
     e.add_request("r", [2, 3, 4], SamplingParams(max_tokens=6, ignore_eos=True))
-    stages = []
+    works = []
     for _ in range(2000):
         if not e.has_unfinished_requests():
             break
         e.step()
-        stages.append(e.last_schedule.stage)
+        works.extend(e.last_schedule.works)
     else:
         pytest.fail("speculative engine did not drain")
-    assert Stage.SPECULATIVE in stages
+    assert WorkKey.SPECULATIVE in works
     assert e.rng.peek("r") is None
 
 
@@ -375,7 +376,7 @@ def test_speculative_path_advances_the_registry_generator():
     def step_until_speculative():
         for _ in range(10):
             e.step()
-            if e.last_schedule.stage == Stage.SPECULATIVE:
+            if e.last_schedule.is_speculative:
                 return True
         return False
 
@@ -522,7 +523,7 @@ def test_greedy_round_reads_back_once_with_ragged_requests():
                 e.step()
             finally:
                 torch.cuda.set_sync_debug_mode("default")
-        if e.last_schedule.stage == Stage.SPECULATIVE:
+        if e.last_schedule.is_speculative:
             rounds += 1
             assert sum("synchroniz" in str(w.message) for w in caught) == 1
     assert rounds > 1
@@ -604,7 +605,7 @@ def test_common_submit_entry_preserves_prefill_and_speculative_results(atomic, m
     submit = e.executor.submit
 
     def record(batch):
-        calls.append((batch.stage, batch.is_speculative))
+        calls.append((batch.works, batch.is_speculative))
         return submit(batch)
 
     monkeypatch.setattr(e.executor, "submit", record)
@@ -616,13 +617,14 @@ def test_common_submit_entry_preserves_prefill_and_speculative_results(atomic, m
     assert actual.exit_depths == expected.exit_depths
     assert any(flag for _, flag in calls)
     assert any(not flag for _, flag in calls)
-    assert all(flag == (stage == Stage.SPECULATIVE) for stage, flag in calls)
+    assert all(flag == (works == frozenset((WorkKey.SPECULATIVE,))) for works, flag in calls)
     assert e.cache_manager.num_used_blocks == 0
 
 
 def test_common_submit_rejects_speculation_without_controller():
     e = LLMEngine(model())
-    batch = SchedulerOutput(Stage.SPECULATIVE, [])
+    request = Request("r", [1], SamplingParams())
+    batch = SchedulerOutput([ScheduledRequest(request, WorkKey.SPECULATIVE, 0, 1)])
     with pytest.raises(ValueError, match="configured round controller"):
         e.executor.submit(batch).collect()
 
@@ -642,7 +644,7 @@ def test_speculative_submit_defers_collection_and_collects_once(monkeypatch, tem
         "r", [2, 3, 4], SamplingParams(max_tokens=9, ignore_eos=True, temperature=temperature)
     )
     try:
-        while e.scheduler.requests["r"].stage != Stage.SPECULATIVE:
+        while e.scheduler.pending_work(e.scheduler.requests["r"]) != WorkKey.SPECULATIVE:
             e.step()
         batch = e._schedule()
         ticket = e.executor.submit(batch)

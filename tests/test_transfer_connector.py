@@ -7,9 +7,10 @@ import torch
 
 from tests.test_stage_engine import RecordingConnector, make_engine
 from vllm_rlt import SamplingParams
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.pd.config import PDConfig
 from vllm_rlt.pd.connector import PDStageConnector
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestStatus
 
 
 def make_connector(engine, slots=4):
@@ -55,7 +56,7 @@ def test_import_requires_commit_all_sequences_and_capacity(commit_first):
     assert sum(w.active for w in transfers) == 3
     blocked = next(w for w in transfers if not w.active)
     active = next(w for w in transfers if w.active)
-    assert blocked.request.stage == Stage.RECEIVING
+    assert blocked.request.status == RequestStatus.RECEIVING
     assert engine.cache_manager.has_transfer_lease(blocked.tid)
     assert engine.scheduler.requests[active.tid] is active.request
     connector.cancel(active.tid)
@@ -72,8 +73,8 @@ def test_cancelled_export_holds_slot_and_kv_until_local_and_remote_access_end():
     event = transfer.last_event = Mock()
     event.query.return_value = False
     connector.cancel(transfer.tid)
-    assert transfer.request.stage == Stage.TRANSFERRING
-    assert all(transfer.tid not in q for q in engine.scheduler.queues.values())
+    assert transfer.request.status == RequestStatus.TRANSFERRING
+    assert all(transfer.tid not in q for q in engine.scheduler.work_queues.values())
     connector.progress()
     assert not connector.free_slots
     assert engine.cache_manager.has_transfer_lease(transfer.tid)
@@ -104,7 +105,7 @@ def test_cancelled_import_waits_for_safe_notification_and_old_generation_is_igno
     current = reserve(connector, "generation-2")
     connector.progress()  # Old completion cannot activate the reused staging slot.
     connector.commit(old.tid, 1)
-    assert current.request.stage == Stage.RECEIVING
+    assert current.request.status == RequestStatus.RECEIVING
     assert current.received == set()
     assert engine.cache_manager.has_transfer_lease(current.tid)
     connector.cancel(current.tid)
@@ -116,7 +117,7 @@ def test_compute_release_checks_event_and_identity_without_releasing_kv():
     engine = make_engine(role="prefill")
     engine.connector = RecordingConnector()
     request = engine.reserve_transfer("r", [1, 2], SamplingParams(max_tokens=1), receiving=False)
-    while request.stage != Stage.TRANSFERRING:
+    while request.status != RequestStatus.TRANSFERRING:
         engine.step()
     event = Mock()
     event.query.return_value = False
@@ -146,7 +147,7 @@ def test_mixed_connector_handles_both_transfer_directions_by_request():
     connector.transport.poll.return_value = ([], [("peer", incoming.tid, 0)])
     connector.progress()
     assert incoming.active
-    assert outgoing.request.stage == Stage.PREFILLING_PRELUDE
+    assert engine.scheduler.pending_work(outgoing.request) == WorkKey.PROMPT_PRELUDE
     connector.cancel(outgoing.tid)
     connector.cancel(incoming.tid)
     connector.progress()

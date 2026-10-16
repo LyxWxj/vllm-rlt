@@ -9,7 +9,7 @@ admitted request population.
 
 import torch
 
-from vllm_rlt.request import Stage
+from vllm_rlt.request import RequestStatus
 
 
 class PreemptionManager:
@@ -32,7 +32,7 @@ class PreemptionManager:
         e = self.engine
         if (
             request is requesting_request
-            or request.stage in (Stage.WAITING, Stage.RECEIVING)
+            or request.status != RequestStatus.ACTIVE
             or request.num_output_placeholders
             or request.request_id in excluded
         ):
@@ -84,11 +84,14 @@ class PreemptionManager:
         if victim is None:
             return False
         e = self.engine
+        resume_work = e.scheduler.pending_work(victim)
+        if resume_work is None:
+            return False
         e.model_runner.synchronize()
-        e._rewind_split_prefill(victim)
+        resume_work = e._rewind_split_prefill(victim, resume_work)
         cache = e.cache_manager
         snapshot = dict(
-            stage=victim.stage,
+            resume_work=resume_work,
             kv=cache.snapshot(victim.request_id),
             hidden=None if victim.hidden_state is None else victim.hidden_state.cpu().clone(),
             token=None
@@ -100,12 +103,9 @@ class PreemptionManager:
         e.model_runner.suspend(victim.request_id)
         cache.poll_prefixes()
         cache.free(victim.request_id)
-        for q in e.scheduler.queues.values():
-            while victim.request_id in q:
-                q.remove(victim.request_id)
         victim.hidden_state = victim.input_token_tensor = None
         self.snapshots[victim.request_id] = snapshot
-        e.scheduler.enqueue(victim, Stage.WAITING)
+        e.scheduler.park_waiting(victim)
         self.preemptions += 1
         return True
 
@@ -132,7 +132,8 @@ class PreemptionManager:
         # Restored buffers become visible to every runner stream before resumption.
         if cache.device.type == "cuda":
             torch.cuda.current_stream(cache.device).synchronize()
-        e.scheduler.enqueue(request, state["stage"])
+        e.scheduler.activate_request(request)
+        e.scheduler.enqueue_work(request, state["resume_work"])
         del self.snapshots[request.request_id]
         self.resumptions += 1
         return True

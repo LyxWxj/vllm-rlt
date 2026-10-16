@@ -2,8 +2,9 @@
 
 from typing import Protocol
 
+from vllm_rlt.core.execution import WorkKey
 from vllm_rlt.core.scheduler import PrefillProgress
-from vllm_rlt.request import Request, Stage
+from vllm_rlt.request import Request
 
 
 class StageConnector(Protocol):
@@ -19,7 +20,7 @@ class StageConnector(Protocol):
         self,
         request: Request,
         *,
-        phase: Stage,
+        work: WorkKey,
         start: int | None,
         progress: PrefillProgress,
         event,

@@ -1139,7 +1139,7 @@ class ModelRunner:
         execution needs only ExecutionBatch; neither path waits for readback here
         unless bounded buffers must be recycled.
         """
-        split_prefill = batch.has_chunks
+        split_prefilling = batch.split_prefilling
         # A fused prelude + loops stays resident on core; chunking does not
         # change the stream of an otherwise standalone prelude or coda.
         stream = self.core_stream if batch.loop_count else self.boundary_stream
@@ -1147,7 +1147,9 @@ class ModelRunner:
         routing_finish_attempted = False
         slot = None
         try:
-            prepare_on_stream = stream is not None and (split_prefill or self.async_state is None)
+            prepare_on_stream = stream is not None and (
+                split_prefilling or self.async_state is None
+            )
             if prepare_on_stream:
                 source_stream = torch.cuda.current_stream(self.device)
                 with torch.cuda.stream(stream):
@@ -1161,7 +1163,7 @@ class ModelRunner:
             while self.submission_events and self.submission_events[0].query():
                 self.submission_events.popleft()
             if len(self.submission_events) >= 3:
-                if split_prefill:
+                if split_prefilling:
                     self.split_prefill_submission_waits += 1
                 self.submission_events.popleft().synchronize()
             if prepared.routing is not None:
@@ -1225,7 +1227,7 @@ class ModelRunner:
                     for span in batch.spans:
                         self.events[span.request.request_id] = compute_done
                     self.submission_events.append(compute_done)
-            if split_prefill:
+            if split_prefilling:
                 self.split_prefill_submissions += 1
             self._release_prepared_metadata(prepared, compute_done)
             return Submission(

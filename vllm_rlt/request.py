@@ -6,18 +6,11 @@ import torch
 from vllm_rlt.sampling_params import SamplingParams
 
 
-class Stage(str, Enum):
+class RequestStatus(str, Enum):
     WAITING = "waiting"
     RECEIVING = "receiving"
     TRANSFERRING = "transferring"
-    MIXED = "mixed"  # Batch policy label; never a request lifecycle phase.
-    PREFILL = "prefill"
-    PREFILLING_PRELUDE = "prefilling_prelude"
-    PREFILLING_RECURRENT = "prefilling_recurrent"
-    PRELUDE = "prelude"
-    RECURRENT = "recurrent"
-    SPECULATIVE = "speculative"
-    CODA = "coda"
+    ACTIVE = "active"
     FINISHED = "finished"
 
 
@@ -32,7 +25,7 @@ class Request:
     request_id: str
     prompt_token_ids: list[int]
     sampling_params: SamplingParams
-    stage: Stage = Stage.WAITING
+    status: RequestStatus = RequestStatus.WAITING
     generated_token_ids: list[int] = field(default_factory=list)
     exit_depths: list[int] = field(default_factory=list)
     # Scheduling advances before coda's CPU output delivery.
@@ -114,7 +107,7 @@ class RequestOutput:
             prompt_token_ids=list(request.prompt_token_ids),
             token_ids=list(request.generated_token_ids),
             exit_depths=list(request.exit_depths),
-            finished=request.stage == Stage.FINISHED,
+            finished=request.status == RequestStatus.FINISHED,
             finish_reason=request.finish_reason.value
             if request.finish_reason is not None
             else None,
