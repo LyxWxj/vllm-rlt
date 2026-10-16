@@ -160,7 +160,7 @@ class MixedPolicy(SplitPrefillPolicy):
     """Choose compatible prompt/generation loops; execution is policy-agnostic."""
 
     def schedule(self, scheduler, *, prefer_recurrent=False):
-        if scheduler.has_ready(Stage.RECURRENT) and scheduler.has_ready(Stage.PREFILLING_RECURRENT):
+        if scheduler.has_ready_phases(Stage.RECURRENT, Stage.PREFILLING_RECURRENT):
             return scheduler.take_stages(
                 (Stage.RECURRENT, Stage.PREFILLING_RECURRENT), label=Stage.MIXED
             )

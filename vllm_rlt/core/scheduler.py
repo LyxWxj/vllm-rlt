@@ -455,12 +455,16 @@ class Scheduler:
         """
         return request.num_preluded_tokens == request.num_prefilled_tokens
 
-    def has_ready(self, phase):
+    def has_ready(self, phase: Stage) -> bool:
         """A blocked transport queue must not hide another runnable phase."""
         queue = self.queues[phase]
         if self.execution_ready is None:
             return bool(queue)
         return any(self.execution_ready(self.requests[rid]) for rid in queue)
+
+    def has_ready_phases(self, *phases: Stage) -> bool:
+        """Return whether every listed phase has at least one runnable request."""
+        return bool(phases) and all(self.has_ready(phase) for phase in phases)
 
     def _take(self, stage: Stage) -> SchedulerOutput | None:
         return self.take_stages((stage,), label=stage)
